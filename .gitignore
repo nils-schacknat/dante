@@ -1,3 +1,4 @@
 __pycache__
 compiled_models*
 *.pth
+/*.mp4

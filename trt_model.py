@@ -19,9 +19,12 @@ class TensorRTModel:
         self.input_shape = input_shape  # NCHW
         self.logger = trt.Logger(logger_level)
 
-        # Make sure PyTorch is on the right GPU device
-        torch.cuda.set_device(device)
-        _ = torch.zeros(0, device="cuda")  # force CUDA context init
+        self.device = torch.device(type="cuda", index=device)
+        # Create a PyCUDA context on `device`
+        cuda.init()                  # Initialize the CUDA driver (if not already done)
+        self.cuda_device = cuda.Device(device)
+        self.ctx = self.cuda_device.make_context()  # push a new context on GPU `device`
+        _ = torch.zeros(0, device=self.device)  # force CUDA context init
 
         # Load serialized engine into TRT runtime
         self.runtime = trt.Runtime(self.logger)
@@ -31,6 +34,15 @@ class TensorRTModel:
 
         # Allocate GPU buffers (torch tensors) for all I/O bindings
         self.inputs, self.outputs, self.bindings, self.stream = self._allocate_buffers()
+
+    def __del__(self):
+        # 5) Pop & destroy the PyCUDA context when the object goes out of scope
+        try:
+            # Pop the context that was pushed in __init__
+            self.ctx.pop()
+        except Exception:
+            # In some interpreter-shutdown scenarios, cuda may already be torn down.
+            pass
 
     def _allocate_buffers(self):
         """
@@ -67,7 +79,7 @@ class TensorRTModel:
             }[np.dtype(np_dtype)]
 
             # Create a zeroed tensor on the correct CUDA device:
-            t = torch.zeros(tuple(shape), dtype=torch_dtype, device="cuda")
+            t = torch.zeros(tuple(shape), dtype=torch_dtype, device=self.device)
             # Record its device pointer
             device_ptr = t.data_ptr()
 
@@ -89,7 +101,10 @@ class TensorRTModel:
         We then bind the raw data_ptr() of that input_tensor into TRT, run, and return the
         CUDA output tensor(s) directly.
         """
-        assert input_tensor.device.type == "cuda", "Input must be on CUDA"
+        if input_tensor.dtype != torch.float32:
+            input_tensor = input_tensor.to(torch.float32)
+
+        assert input_tensor.device == self.device, f"Expected input tensor device is {self.device}, got {input_tensor.device}"
         batch_size = input_tensor.shape[0]
 
         # If user’s batch < engine batch, we zero-pad along dim0 to match exactly:
@@ -99,7 +114,7 @@ class TensorRTModel:
             padding = torch.zeros(
                 (pad_batch, *input_tensor.shape[1:]),
                 dtype=input_tensor.dtype,
-                device="cuda",
+                device=self.device,
             )
             input_tensor = torch.cat([input_tensor, padding], dim=0)
 
@@ -132,16 +147,13 @@ class TensorRTModel:
         results = []
         for out_dict in self.outputs:
             full_tensor = out_dict["tensor"]
-            # shape might be (engine_batch, channels, h, w). We only want [:batch_size]
-            out_shape = full_tensor.shape
-            trimmed = full_tensor[:batch_size].clone()  # clone if you need an independent view
-            results.append(trimmed)
+            results.append(full_tensor[:batch_size])
 
         return results
 
     def benchmark(self, num_runs=100):
         # Create a random CUDA tensor of shape input_shape:
-        input_cuda = torch.randn(self.input_shape, device="cuda", dtype=torch.float32)
+        input_cuda = torch.randn(self.input_shape, device=self.device, dtype=torch.float32)
         total_time = 0.0
         for _ in range(num_runs):
             torch.cuda.synchronize()
@@ -155,8 +167,16 @@ class TensorRTModel:
         print(f"Average per-image inference time: {avg_time_ms:.2f} ms")
         print(f"FPS: {fps:.2f}")
 
+    def transform_cpu(self, image):
+        _, _, h, w = self.input_shape
+        image = cv2.resize(image, (w, h))
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        image_transformed = (image.astype(np.float32) / 255.0 - mean) / std
+        return image_transformed.transpose(2, 0, 1)
+
     def transform(self, image: np.ndarray) -> torch.Tensor:
-        img_t = torch.from_numpy(image).to("cuda")
+        img_t = torch.from_numpy(image).to(self.device)
         img_t = img_t.permute(2, 0, 1).unsqueeze(0)
         img_t = img_t.float() / 255.0
         _, _, h, w = self.input_shape
@@ -184,7 +204,7 @@ if __name__ == "__main__":
     engine_path = f"compiled_models/depth_anything_v2_s_{input_size[0]}x{input_size[1]}.trt"
     model = TensorRTModel(engine_path, input_shape=(batch_size, 3, *input_size))
 
-    dummy_input = torch.rand(batch_size, 3, *input_size).cuda()
+    dummy_input = torch.rand(batch_size, 3, *input_size).to(model.device)
     features, cls_token = model.infer(dummy_input)
     print(f"features shape: {features.shape}, cls_token shape:{cls_token.shape}")
     model.benchmark()
