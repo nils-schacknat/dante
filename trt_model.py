@@ -7,115 +7,154 @@ import cv2
 import torch
 import torch.nn.functional as F
 
-
 class TensorRTModel:
-    def __init__(self, engine_path, input_shape=(1, 3, 518, 518), device=0, logger_level=trt.Logger.WARNING):
+    def __init__(
+        self,
+        engine_path,
+        input_shape=(1, 3, 518, 518),
+        device=0,
+        logger_level=trt.Logger.WARNING,
+    ):
         self.engine_path = engine_path
         self.input_shape = input_shape  # NCHW
         self.logger = trt.Logger(logger_level)
 
+        # Make sure PyTorch is on the right GPU device
         torch.cuda.set_device(device)
-        _ = torch.zeros(0, device=f"cuda")
+        _ = torch.zeros(0, device="cuda")  # force CUDA context init
 
-        # Load engine and context
+        # Load serialized engine into TRT runtime
         self.runtime = trt.Runtime(self.logger)
         with open(self.engine_path, "rb") as f:
             self.engine = self.runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
 
-        # Allocate buffers
+        # Allocate GPU buffers (torch tensors) for all I/O bindings
         self.inputs, self.outputs, self.bindings, self.stream = self._allocate_buffers()
 
     def _allocate_buffers(self):
+        """
+        For each binding (input or output), we create a torch.cuda.Tensor of the exact shape
+        needed (with dtype matching TRT’s expectation), record its device pointer, and store it.
+        """
         inputs = []
         outputs = []
-        bindings = [None] * self.engine.num_io_tensors
+        n_bindings = self.engine.num_io_tensors
+        bindings = [None] * n_bindings
         stream = cuda.Stream()
 
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
-            
+        for idx in range(n_bindings):
+            name = self.engine.get_tensor_name(idx)
+            trt_dtype = self.engine.get_tensor_dtype(name)
+            np_dtype = trt.nptype(trt_dtype)
+
+            # If the binding has a dynamic dimension (-1), we fix it now to self.input_shape.
             shape = self.context.get_tensor_shape(name)
             if -1 in shape:
+                # Only allow dynamic batch along dim0; we fix shape to input_shape
                 self.context.set_input_shape(name, self.input_shape)
                 shape = self.context.get_tensor_shape(name)
 
-            size = trt.volume(shape)
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            bindings[i] = int(device_mem)
+            # Compute total element count, e.g. N*C*H*W
+            elem_count = trt.volume(shape)  # this is an int
+            # Construct a torch tensor on GPU with the same dtype & shape
+            # Note: trt.nptype(...) gives something like numpy.float32 → we map to torch.float32
+            torch_dtype = {
+                np.dtype("float32"): torch.float32,
+                np.dtype("int32"): torch.int32,
+                np.dtype("float16"): torch.float16,
+                # you can extend this map if you have other dtypes
+            }[np.dtype(np_dtype)]
 
+            # Create a zeroed tensor on the correct CUDA device:
+            t = torch.zeros(tuple(shape), dtype=torch_dtype, device="cuda")
+            # Record its device pointer
+            device_ptr = t.data_ptr()
+
+            # The binding expects a raw pointer (int) to GPU memory:
+            bindings[idx] = int(device_ptr)
+
+            # Figure out if this is an input or output:
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                inputs.append({'name': name, 'host': host_mem, 'device': device_mem})
+                inputs.append({"name": name, "tensor": t})
             else:
-                outputs.append({'name': name, 'host': host_mem, 'device': device_mem})
+                outputs.append({"name": name, "tensor": t})
 
         return inputs, outputs, bindings, stream
 
-    def infer(self, input_tensor):
+    def infer(self, input_tensor: torch.Tensor):
+        """
+        Assumes `input_tensor` is already a CUDA tensor of shape ≤ self.input_shape.
+        If it’s smaller along the batch dim, we pad; if it’s bigger, we error out.
+        We then bind the raw data_ptr() of that input_tensor into TRT, run, and return the
+        CUDA output tensor(s) directly.
+        """
+        assert input_tensor.device.type == "cuda", "Input must be on CUDA"
         batch_size = input_tensor.shape[0]
-        if isinstance(input_tensor, torch.Tensor):
-            input_tensor = input_tensor.cpu().numpy()
 
+        # If user’s batch < engine batch, we zero-pad along dim0 to match exactly:
         if batch_size < self.input_shape[0]:
-            # Expand input tensor with zeros to match the expected batch size
-            pad_shape = (self.input_shape[0] - input_tensor.shape[0],) + input_tensor.shape[1:]
-            padding = np.zeros(pad_shape, dtype=input_tensor.dtype)
-            input_tensor = np.concatenate([input_tensor, padding], axis=0)
+            pad_batch = self.input_shape[0] - batch_size
+            # pad zeros on the GPU in the same dtype
+            padding = torch.zeros(
+                (pad_batch, *input_tensor.shape[1:]),
+                dtype=input_tensor.dtype,
+                device="cuda",
+            )
+            input_tensor = torch.cat([input_tensor, padding], dim=0)
 
         elif batch_size > self.input_shape[0]:
-            # Raise error because batch size exceeds defined batch size
-            raise ValueError(f"Input batch size {input_tensor.shape[0]} exceeds expected batch size {self.input_shape[0]}")
+            raise ValueError(
+                f"Input batch size {batch_size} > expected {self.input_shape[0]}"
+            )
 
-        # Flatten and copy input to host memory
-        np.copyto(self.inputs[0]['host'], input_tensor.ravel())
+        # Make sure it’s contiguous (so data_ptr() matches layout TRT expects).
+        input_tensor = input_tensor.contiguous()
 
-        # Copy input to device
-        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
+        # Bind the input tensor’s device pointer:
+        self.context.set_tensor_address(
+            self.inputs[0]["name"], int(input_tensor.data_ptr())
+        )
 
-        for tensor in self.inputs + self.outputs:
-            self.context.set_tensor_address(tensor['name'], tensor['device'])
+        # Bind each preallocated output tensor’s device pointer:
+        for out_dict in self.outputs:
+            name = out_dict["name"]
+            t = out_dict["tensor"]
+            self.context.set_tensor_address(name, int(t.data_ptr()))
 
-        # Execute inference
+        # Execute inference asynchronously
         self.context.execute_async_v3(stream_handle=self.stream.handle)
-
-        # Copy outputs back to host
-        for out in self.outputs:
-            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
-
+        # Wait for TRT to finish writing into our output tensors
         self.stream.synchronize()
 
-        # Parse the outputs
+        # At this point, self.outputs[i]["tensor"] already holds the output on CUDA.
+        # We can slice off any padded rows if batch < engine_batch:
         results = []
-        for out in self.outputs:
-            name = out['name']
-            shape = self.context.get_tensor_shape(name)
-            array = np.array(out['host']).reshape(shape)[:batch_size]
-            results.append(torch.from_numpy(array).cuda())
+        for out_dict in self.outputs:
+            full_tensor = out_dict["tensor"]
+            # shape might be (engine_batch, channels, h, w). We only want [:batch_size]
+            out_shape = full_tensor.shape
+            trimmed = full_tensor[:batch_size].clone()  # clone if you need an independent view
+            results.append(trimmed)
+
         return results
-    
+
     def benchmark(self, num_runs=100):
-        input_tensor = np.random.rand(*self.input_shape).astype(np.float32)
+        # Create a random CUDA tensor of shape input_shape:
+        input_cuda = torch.randn(self.input_shape, device="cuda", dtype=torch.float32)
         total_time = 0.0
         for _ in range(num_runs):
+            torch.cuda.synchronize()
             start = time.time()
-            self.infer(input_tensor)
+            self.infer(input_cuda)
+            torch.cuda.synchronize()
             total_time += time.time() - start
+
         avg_time_ms = (total_time / num_runs) * 1000 / self.input_shape[0]
         fps = 1000.0 / avg_time_ms
-        print(f"Average Inference Time: {avg_time_ms:.2f} ms")
-        print(f"FPS (Frames per Second): {fps:.2f}")
+        print(f"Average per-image inference time: {avg_time_ms:.2f} ms")
+        print(f"FPS: {fps:.2f}")
 
-    def transform_(self, image):
-        _, _, h, w = self.input_shape
-        image = cv2.resize(image, (w, h))
-
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        image_transformed = (image.astype(np.float32) / 255.0 - mean) / std
-        return image_transformed.transpose(2, 0, 1)[None]
-    
     def transform(self, image: np.ndarray) -> torch.Tensor:
         img_t = torch.from_numpy(image).to("cuda")
         img_t = img_t.permute(2, 0, 1).unsqueeze(0)
@@ -126,7 +165,7 @@ class TensorRTModel:
         std  = torch.tensor([0.229, 0.224, 0.225], device=img_resized.device).view(1, 3, 1, 1)
         image_transformed = (img_resized - mean) / std
         return image_transformed
-    
+
 
 def load_backbone(
     input_size,
@@ -141,11 +180,11 @@ def load_backbone(
 # Example usage
 if __name__ == "__main__":
     batch_size = 1
-    input_size = (518, 518)
+    input_size = (518, 924)
     engine_path = f"compiled_models/depth_anything_v2_s_{input_size[0]}x{input_size[1]}.trt"
     model = TensorRTModel(engine_path, input_shape=(batch_size, 3, *input_size))
 
-    dummy_input = np.random.rand(batch_size, 3, *input_size).astype(np.float32)
+    dummy_input = torch.rand(batch_size, 3, *input_size).cuda()
     features, cls_token = model.infer(dummy_input)
     print(f"features shape: {features.shape}, cls_token shape:{cls_token.shape}")
     model.benchmark()

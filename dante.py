@@ -44,20 +44,15 @@ class DANTE(L.LightningModule):
         checkpoint['state_dict'] = self.linear.state_dict()
 
     def infer_image(self, image):
-        t = time.time()
         image_transformed = self.backbone.transform(image)
-        t1 = time.time()
         with torch.no_grad():
             mask_small = self(image_transformed).unsqueeze(0)
-        t2 = time.time()
         mask_large = F.interpolate(
             mask_small, 
             size=image.shape[:2], 
             mode="bilinear", 
             align_corners=False
         ).squeeze(0).squeeze(0).cpu().numpy()
-        t3 = time.time()
-        print((t1-t)/(t3-t))
         return mask_large
 
 
@@ -71,8 +66,4 @@ if __name__ == "__main__":
     dante = DANTE(backbone=backbone).to("cuda")
 
     image = cv2.cvtColor(cv2.imread("assets/example_image.jpg"), cv2.COLOR_BGR2RGB)
-    import time
-    t = time.time()
-    for i in range(1000):
-        mask = dante.infer_image(image)
-    print((time.time()-t)/1000)
+    mask = dante.infer_image(image)
