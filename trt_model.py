@@ -7,21 +7,34 @@ import cv2
 import torch
 import torch.nn.functional as F
 
+
 class TensorRTModel:
+    """
+    This class loads the compiled TRT engine.
+    """
     def __init__(
         self,
-        engine_path,
+        engine_path: str,
         input_shape=(1, 3, 518, 518),
         device=0,
         logger_level=trt.Logger.WARNING,
     ):
+        """
+        Args:
+            engine_path (str): Path to the TRT engine file.
+            input_shape (tuple): Shape of the input tensors. The batch size is dynamic,
+                channels, height and width are fixed and need to be the same as the model has
+                been compiled with.
+            device (int): The gpu to use (if multiple are available).
+            logger_level (int): The logger level.
+        """
         self.engine_path = engine_path
-        self.input_shape = input_shape  # NCHW
+        self.input_shape = input_shape
         self.logger = trt.Logger(logger_level)
-
         self.device = torch.device(type="cuda", index=device)
+
         # Create a PyCUDA context on `device`
-        cuda.init()                  # Initialize the CUDA driver (if not already done)
+        cuda.init()  # Initialize the CUDA driver (if not already done)
         self.cuda_device = cuda.Device(device)
         self.ctx = self.cuda_device.make_context()  # push a new context on GPU `device`
         _ = torch.zeros(0, device=self.device)  # force CUDA context init
@@ -36,13 +49,11 @@ class TensorRTModel:
         self.inputs, self.outputs, self.bindings, self.stream = self._allocate_buffers()
 
     def __del__(self):
-        # 5) Pop & destroy the PyCUDA context when the object goes out of scope
+        # Pop & destroy the PyCUDA context when the object goes out of scope
         try:
-            # Pop the context that was pushed in __init__
-            self.ctx.pop()
+            self.ctx.pop()  # Pop the context that was pushed in __init__
         except Exception:
-            # In some interpreter-shutdown scenarios, cuda may already be torn down.
-            pass
+            pass  # In some interpreter-shutdown scenarios, cuda may already be torn down.
 
     def _allocate_buffers(self):
         """
@@ -75,7 +86,6 @@ class TensorRTModel:
                 np.dtype("float32"): torch.float32,
                 np.dtype("int32"): torch.int32,
                 np.dtype("float16"): torch.float16,
-                # you can extend this map if you have other dtypes
             }[np.dtype(np_dtype)]
 
             # Create a zeroed tensor on the correct CUDA device:
@@ -94,23 +104,29 @@ class TensorRTModel:
 
         return inputs, outputs, bindings, stream
 
-    def infer(self, input_tensor: torch.Tensor):
+    def infer(self, input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Assumes `input_tensor` is already a CUDA tensor of shape ≤ self.input_shape.
-        If it’s smaller along the batch dim, we pad; if it’s bigger, we error out.
-        We then bind the raw data_ptr() of that input_tensor into TRT, run, and return the
-        CUDA output tensor(s) directly.
+        Run inference on the given input tensor. The tensor should be correctly transformed
+        through self.transform.
+
+        Args:
+            input_tensor (torch.Tensor): The input tensor to be processed.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: The output tensors.
         """
+        # Cast to torch.float32 if necessary
         if input_tensor.dtype != torch.float32:
             input_tensor = input_tensor.to(torch.float32)
 
+        # Check device
         assert input_tensor.device == self.device, f"Expected input tensor device is {self.device}, got {input_tensor.device}"
         batch_size = input_tensor.shape[0]
 
-        # If user’s batch < engine batch, we zero-pad along dim0 to match exactly:
+        # If the provided tensor's batch size is smaller than the engine's batch size,
+        # it is zero-padded along the batch dimension
         if batch_size < self.input_shape[0]:
             pad_batch = self.input_shape[0] - batch_size
-            # pad zeros on the GPU in the same dtype
             padding = torch.zeros(
                 (pad_batch, *input_tensor.shape[1:]),
                 dtype=input_tensor.dtype,
@@ -143,7 +159,7 @@ class TensorRTModel:
         self.stream.synchronize()
 
         # At this point, self.outputs[i]["tensor"] already holds the output on CUDA.
-        # We can slice off any padded rows if batch < engine_batch:
+        # We can slice off any padded rows if batch < engine_batch
         results = []
         for out_dict in self.outputs:
             full_tensor = out_dict["tensor"]
@@ -152,6 +168,12 @@ class TensorRTModel:
         return results
 
     def benchmark(self, num_runs=100):
+        """
+        Runs inference for the given number and reports the average time.
+
+        Args:
+            num_runs (int): Number of times to run the inference.
+        """
         # Create a random CUDA tensor of shape input_shape:
         input_cuda = torch.randn(self.input_shape, device=self.device, dtype=torch.float32)
         total_time = 0.0
@@ -167,20 +189,44 @@ class TensorRTModel:
         print(f"Average per-image inference time: {avg_time_ms:.2f} ms")
         print(f"FPS: {fps:.2f}")
 
-    def transform_cpu(self, image):
+    def transform_cpu(self, image: np.ndarray) -> np.ndarray:
+        """
+        On the cpu, transforms an input image to enable inference.
+
+        Args:
+            image (np.ndarray): The input image.
+        """
+        # Resize to specified height and width
         _, _, h, w = self.input_shape
         image = cv2.resize(image, (w, h))
+
+        # Normalize
         mean = np.array([0.485, 0.456, 0.406])
         std = np.array([0.229, 0.224, 0.225])
         image_transformed = (image.astype(np.float32) / 255.0 - mean) / std
+
+        # Transpose
         return image_transformed.transpose(2, 0, 1)
 
     def transform(self, image: np.ndarray) -> torch.Tensor:
+        """
+        On the gpu, transforms an input image to enable inference.
+
+        Args:
+            image (np.ndarray): The input image.
+        """
+        # Transform the image to a Tensor and move to the gpu
         img_t = torch.from_numpy(image).to(self.device)
+
+        # Transpose
         img_t = img_t.permute(2, 0, 1).unsqueeze(0)
+
+        # Resize to specified height and width
         img_t = img_t.float() / 255.0
         _, _, h, w = self.input_shape
         img_resized = F.interpolate(img_t, size=(h, w), mode="bilinear", align_corners=False)
+
+        # Normalize
         mean = torch.tensor([0.485, 0.456, 0.406], device=img_resized.device).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225], device=img_resized.device).view(1, 3, 1, 1)
         image_transformed = (img_resized - mean) / std
@@ -188,19 +234,33 @@ class TensorRTModel:
 
 
 def load_backbone(
-    input_size,
+    input_size: tuple[int, int],
     batch_size=1,
     engine_type="depth_anything_v2_s",
     device=0
 ):
+    """
+    A wrapper which loads the TRT model.
+
+    Args:
+        input_size (tuple[int, int]): The height and width of the input tensors.
+        batch_size (int): The batch size.
+        engine_type (str): The name of the backbone.
+        device (int): The gpu to use (if multiple are available).
+
+    Returns:
+        (TensorRTModel) The loaded model.
+    """
     engine_path = f"compiled_models/{engine_type}_{input_size[0]}x{input_size[1]}.trt"
     return TensorRTModel(engine_path, input_shape=(batch_size, 3, *input_size), device=device)
 
 
-# Example usage
 if __name__ == "__main__":
-    batch_size = 1
+    # The input dimensions the model backbone has been compiled with
     input_size = (518, 924)
+    # The batch size to initialize the backbone with
+    batch_size = 1
+
     engine_path = f"compiled_models/depth_anything_v2_s_{input_size[0]}x{input_size[1]}.trt"
     model = TensorRTModel(engine_path, input_shape=(batch_size, 3, *input_size))
 

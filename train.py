@@ -11,7 +11,17 @@ import lightning as L
 from torch.utils.data import DataLoader, ConcatDataset
 
 
-def random_square_crop(frame, mask):
+def random_square_crop(frame: np.ndarray, mask:np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Randomly crop a frame and its corresponding mask to a square of the largest possible size.
+
+    Args:
+        frame (np.array): The frame to be cropped.
+        mask (np.array): The mask to be cropped.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: The cropped frame and its corresponding mask.
+    """
     # Get dimensions
     h, w = frame.shape[:2]
     crop_size = min(h, w)
@@ -30,7 +40,17 @@ def random_square_crop(frame, mask):
 
 
 class TraversabilityDataset(Dataset):
-    def __init__(self, data_dir: Path, transform, random_crop_to_square=True):
+    """
+    Construct a Dataset from annotated frames.
+    """
+    def __init__(self, data_dir: Path, transform: callable, random_crop_to_square=True):
+        """
+        Args:
+            data_dir (Path): Path to the directory containing the annotated frames.
+                The directory should contain frames: frame_*.jpg with corresponding masks mask_*.jpg.
+            transform (callable): A function that transforms the raw images for the model.
+            random_crop_to_square (bool): Whether to randomly crop frames to square. Default is true.
+        """
         super().__init__()
         self.data_dir = Path(data_dir)
         self.indices = [p.stem.split("_")[1] for p in self.data_dir.glob("mask_*.png")]
@@ -54,21 +74,26 @@ class TraversabilityDataset(Dataset):
     
 
 if __name__ == "__main__":
+    # The input dimensions the backbone has been compiled with
+    # during training we use square crops
     input_size = (518, 518)
+    # The batch size to initialize the backbone with, for training, we use 16 for training
     batch_size = 16
+    # The gpu the backbone and model should run on (if multiple are available)
     device = 0
 
     backbone = load_backbone(input_size=input_size, batch_size=batch_size, device=device)
     dante = DANTE(backbone=backbone).to(backbone.device)
-    image = torch.rand(size=(1, 3, 518, 518)).to(backbone.device)
-    mask = dante(image)
 
     data_dir = "assets/training_data"
     dataset = TraversabilityDataset(data_dir=data_dir, transform=backbone.transform_cpu)
 
+    # The training should run for 128 steps, therefore the dataset is repeated
+    # Now it is only necessary to iterate through the dataloader once, which is much quicker
     num_epochs = 128
     dataloader = DataLoader(ConcatDataset([dataset]*(num_epochs*16//len(dataset))), batch_size=batch_size, shuffle=True, num_workers=16)
 
+    # Initialize the trainer and start training
     trainer = L.Trainer(
         max_epochs=1, 
         enable_progress_bar=True,
@@ -80,5 +105,6 @@ if __name__ == "__main__":
         model=dante, 
         train_dataloaders=dataloader, 
     )
+    # Save the trained linear layer
     dante = dante.to("cpu")
     torch.save(dante.linear.state_dict(), "trained_decoder.pth")
