@@ -1,0 +1,8 @@
+onnx
+tensorrt
+pycuda
+opencv-python
+pathlib
+lightning
+tqdm
+scikit-learn
