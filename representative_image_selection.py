@@ -78,7 +78,7 @@ if __name__ == "__main__":
     device = 0
 
     backbone = load_backbone(input_size=input_size, device=device)
-    video_path = "assets/stuttgart_university.mp4"
+    video_path = "assets/stuttgart_university_campus.mp4"
     out_path = Path("selected_images/")
     out_path.mkdir(exist_ok=True)
     get_representative_images(video_path=video_path, out_path=out_path, backbone=backbone, k=8)
